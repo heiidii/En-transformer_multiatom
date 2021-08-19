@@ -142,3 +142,25 @@ $ python denoise.py
     primaryClass = {cs.LG}
 }
 ```
+
+```bibtex
+@misc{liu2021pay,
+    title   = {Pay Attention to MLPs}, 
+    author  = {Hanxiao Liu and Zihang Dai and David R. So and Quoc V. Le},
+    year    = {2021},
+    eprint  = {2105.08050},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.LG}
+}
+```
+
+```bibtex
+@misc{su2021roformer,
+    title   = {RoFormer: Enhanced Transformer with Rotary Position Embedding},
+    author  = {Jianlin Su and Yu Lu and Shengfeng Pan and Bo Wen and Yunfeng Liu},
+    year    = {2021},
+    eprint  = {2104.09864},
+    archivePrefix = {arXiv},
+    primaryClass = {cs.CL}
+}
+```

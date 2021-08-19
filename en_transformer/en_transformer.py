@@ -89,6 +89,8 @@ class Residual(nn.Module):
         feats_out, coors_delta = self.fn(feats, coors, **kwargs)
         return feats + feats_out, coors + coors_delta
 
+# feedforward - with geglu
+
 class GEGLU(nn.Module):
     def forward(self, x):
         x, gates = x.chunk(2, dim = -1)
@@ -104,14 +106,85 @@ class FeedForward(nn.Module):
     ):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(dim, dim * 4 * 2),
+            nn.Linear(dim, dim * mult * 2),
             GEGLU(),
             nn.Dropout(dropout),
-            nn.Linear(dim * 4, dim)
+            nn.Linear(dim * mult, dim)
         )
 
-    def forward(self, feats, coors):
+    def forward(self, feats, coors, **kwargs):
         return self.net(feats), 0
+
+# gmlp
+
+class gMLP(nn.Module):
+    def __init__(
+        self,
+        *,
+        dim,
+        mult = 4,
+        dropout = 0.,
+        eps = 1e-3
+    ):
+        super().__init__()
+        self.project_in = nn.Sequential(
+            nn.Linear(dim, dim * mult),
+            nn.GELU(),
+        )
+
+        hidden_dim = dim * mult // 2
+        self.gate_norm = nn.LayerNorm(hidden_dim)
+        self.gate_mixer = nn.Linear(hidden_dim, hidden_dim)
+
+        nn.init.constant_(self.gate_mixer.weight, eps)
+        nn.init.constant_(self.gate_mixer.bias, 1.)
+
+        self.project_out = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim)
+        )
+
+    def forward(
+        self,
+        feats,
+        coors,
+        edges = None,
+        mask = None,
+        adj_mat = None
+    ):
+        x = self.project_in(feats)
+        x, gate = x.chunk(2, dim = -1)
+        gate = self.gate_norm(gate)
+
+        unchanged_gate, gate_to_mix = gate.chunk(2, dim = -1)
+
+        # mix the gates using the relative distances between all nodes
+
+        dist = torch.cdist(coors, coors)
+        dist = 1 / (dist + 1) # mix by the inverse of the distance
+
+        dist_mask = torch.eye(dist.shape[1], device = dist.device).bool()
+        dist_mask = rearrange(dist_mask, 'i j -> () i j')
+
+        if exists(mask):
+            mask = rearrange(mask, 'b i -> b i ()') * rearrange(mask, 'b j -> b () j')
+            dist_mask = dist_mask | ~mask
+
+        dist = dist.masked_fill(dist_mask, 0.)
+
+        # mix the gates across sequence by distance
+
+        mixed_gate = einsum('b j d, b i j -> b i d', gate_to_mix, dist)
+
+        # one more linear to mix the aggregated node vectors against itself
+
+        gate = torch.cat((unchanged_gate, mixed_gate), dim = -1)
+        gate = self.gate_mixer(gate)
+        x = x * gate
+
+        return self.project_out(x), 0
+
+# attention
 
 class Attention(nn.Module):
     def __init__(self, dim, heads = 8, dim_head = 64):
@@ -469,7 +542,8 @@ class EnTransformer(nn.Module):
         norm_coors_scale_init = 1.,
         global_linear_attn_every = 0,
         num_global_tokens = 8,
-        use_cross_product = False
+        use_cross_product = False,
+        use_gmlp = False
     ):
         super().__init__()
         assert dim_head >= 32, 'your dimension per head should be greater than 32 for rotary embeddings to work well'
@@ -494,16 +568,18 @@ class EnTransformer(nn.Module):
         if has_global_attn:
             self.global_tokens = nn.Parameter(torch.randn(num_global_tokens, dim))
 
+        feedforward_class = FeedForward if not use_gmlp else gMLP
+
         for ind in range(depth):
             add_global = global_linear_attn_every > 0 and (ind % global_linear_attn_every) == 0
 
             self.layers.append(nn.ModuleList([
                 nn.ModuleList([
                     Residual(PreNorm(dim, GlobalLinearAttention(dim = dim, heads = heads, dim_head = dim_head))),
-                    Residual(PreNorm(dim, FeedForward(dim = dim))),
+                    Residual(PreNorm(dim, gMLP(dim = dim))),
                 ])  if add_global else None,
                 Residual(PreNorm(dim, EquivariantAttention(dim = dim, dim_head = dim_head, heads = heads, coors_hidden_dim = coors_hidden_dim, edge_dim = (edge_dim + adj_dim),  neighbors = neighbors, only_sparse_neighbors = only_sparse_neighbors, valid_neighbor_radius = valid_neighbor_radius, init_eps = init_eps, rel_pos_emb = rel_pos_emb, norm_rel_coors = norm_rel_coors, norm_coors_scale_init = norm_coors_scale_init, use_cross_product = use_cross_product))),
-                Residual(PreNorm(dim, FeedForward(dim = dim)))
+                Residual(PreNorm(dim, gMLP(dim = dim)))
             ]))
 
     def forward(
@@ -562,12 +638,12 @@ class EnTransformer(nn.Module):
                 global_attn, global_ff = global_fns
 
                 feats, global_tokens = global_attn(feats, global_tokens, mask = mask)
-                feats, coors = global_ff(feats, coors)
+                feats, coors = global_ff(feats, coors, edges = edges, mask = mask, adj_mat = adj_mat)
 
             feats, coors = attn(feats, coors, edges = edges, mask = mask, adj_mat = adj_mat)
             coor_changes.append(coors)
 
-            feats, coors = ff(feats, coors)
+            feats, coors = ff(feats, coors, edges = edges, mask = mask, adj_mat = adj_mat)
 
         if return_coor_changes:
             return feats, coors, coor_changes
